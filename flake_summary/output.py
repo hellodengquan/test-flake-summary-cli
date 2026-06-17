@@ -8,6 +8,7 @@ from . import __version__
 from .models import (
     ClassifiedTestCase,
     FileSummary,
+    SkippedTestCase,
     SummaryReport,
     TeamSummary,
     TestCategory,
@@ -36,6 +37,10 @@ class OutputFormatter:
                     key=lambda x: (-x.flaky_score, x.stats.name),
                 )
             ],
+            "skipped_tests": [
+                OutputFormatter._skipped_test_to_dict(st)
+                for st in report.skipped_tests
+            ],
             "team_summaries": [asdict(ts) for ts in report.team_summaries],
             "file_summaries": [asdict(fs) for fs in report.file_summaries],
         }
@@ -57,6 +62,20 @@ class OutputFormatter:
             "fail_rate": round(ct.stats.fail_rate * 100, 2),
             "fail_ratio_pct": ct.recent_consecutive_failures,
             "history": [h.value for h in ct.stats.history],
+        }
+
+    @staticmethod
+    def _skipped_test_to_dict(st: SkippedTestCase) -> dict:
+        return {
+            "name": st.name,
+            "file": st.file,
+            "team": st.team,
+            "total_runs": st.total_runs,
+            "min_runs_required": st.min_runs_required,
+            "passed": st.passed,
+            "failed": st.failed,
+            "skipped_count": st.skipped,
+            "reason": st.reason,
         }
 
     @staticmethod

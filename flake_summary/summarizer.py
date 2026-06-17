@@ -6,6 +6,7 @@ from typing import Dict, List
 from .models import (
     ClassifiedTestCase,
     FileSummary,
+    SkippedTestCase,
     SummaryReport,
     TeamSummary,
     TestCategory,
@@ -23,7 +24,7 @@ class SummaryGenerator:
     def generate_report(self, test_runs: List[TestRun]) -> SummaryReport:
         filtered_runs = self.classifier.filter_runs_by_time_window(test_runs)
         stats_map = self.classifier.aggregate_stats(filtered_runs)
-        classified_tests = self.classifier.classify(stats_map)
+        classified_tests, skipped_tests = self.classifier.classify(stats_map)
 
         categories: Dict[TestCategory, int] = defaultdict(int)
         for ct in classified_tests:
@@ -44,6 +45,7 @@ class SummaryGenerator:
             team_summaries=team_summaries,
             file_summaries=file_summaries,
             overall_flaky_rate=round(overall_flaky_rate * 100, 2),
+            skipped_tests=skipped_tests,
         )
 
     def _group_by_team(

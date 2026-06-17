@@ -9,6 +9,7 @@ from typing import List
 
 from flake_summary.classifier import TestCaseClassifier, WeightsConfig
 from flake_summary.models import (
+    SkippedTestCase,
     TestCategory,
     TestResult,
     TestRun,
@@ -273,7 +274,7 @@ class TestClassifier(unittest.TestCase):
         statuses = [TestStatus.PASSED] * 5
         runs = self._create_test_runs("test_stable", statuses)
         stats_map = self.classifier.aggregate_stats(runs)
-        classified = self.classifier.classify(stats_map)
+        classified, _ = self.classifier.classify(stats_map)
 
         self.assertEqual(len(classified), 1)
         self.assertEqual(classified[0].category, TestCategory.STABLE_PASS)
@@ -289,7 +290,7 @@ class TestClassifier(unittest.TestCase):
         ]
         runs = self._create_test_runs("test_flaky", statuses)
         stats_map = self.classifier.aggregate_stats(runs)
-        classified = self.classifier.classify(stats_map)
+        classified, _ = self.classifier.classify(stats_map)
 
         self.assertEqual(len(classified), 1)
         self.assertEqual(classified[0].category, TestCategory.FLAKY)
@@ -305,7 +306,7 @@ class TestClassifier(unittest.TestCase):
         ]
         runs = self._create_test_runs("test_continuous_fail", statuses)
         stats_map = self.classifier.aggregate_stats(runs)
-        classified = self.classifier.classify(stats_map)
+        classified, _ = self.classifier.classify(stats_map)
 
         self.assertEqual(len(classified), 1)
         self.assertEqual(classified[0].category, TestCategory.CONTINUOUS_FAIL)
@@ -322,7 +323,7 @@ class TestClassifier(unittest.TestCase):
         ]
         runs = self._create_test_runs("test_ratio", statuses)
         stats_map = classifier.aggregate_stats(runs)
-        classified = classifier.classify(stats_map)
+        classified, _ = classifier.classify(stats_map)
 
         self.assertEqual(classified[0].category, TestCategory.CONTINUOUS_FAIL)
 
@@ -330,7 +331,7 @@ class TestClassifier(unittest.TestCase):
         statuses = [TestStatus.FAILED] * 5
         runs = self._create_test_runs("test_all_fail", statuses)
         stats_map = self.classifier.aggregate_stats(runs)
-        classified = self.classifier.classify(stats_map)
+        classified, _ = self.classifier.classify(stats_map)
 
         self.assertEqual(classified[0].category, TestCategory.CONTINUOUS_FAIL)
         self.assertEqual(classified[0].stats.fail_rate, 1.0)
@@ -339,7 +340,7 @@ class TestClassifier(unittest.TestCase):
         statuses = [TestStatus.FAILED, TestStatus.PASSED]
         runs = self._create_test_runs("test_insufficient", statuses)
         stats_map = self.classifier.aggregate_stats(runs)
-        classified = self.classifier.classify(stats_map)
+        classified, _ = self.classifier.classify(stats_map)
 
         self.assertEqual(len(classified), 0)
 
@@ -392,7 +393,7 @@ class TestClassifier(unittest.TestCase):
         ]
         runs = self._create_test_runs("test_skipped", statuses)
         stats_map = self.classifier.aggregate_stats(runs)
-        classified = self.classifier.classify(stats_map)
+        classified, _ = self.classifier.classify(stats_map)
 
         self.assertEqual(classified[0].stats.fail_rate, 0.6)
         self.assertEqual(classified[0].recent_consecutive_failures, 60)
@@ -931,25 +932,25 @@ class TestMinRunsSkip(unittest.TestCase):
     def test_zero_runs_skipped(self):
         runs = []
         stats_map = self.classifier.aggregate_stats(runs)
-        classified = self.classifier.classify(stats_map)
+        classified, _ = self.classifier.classify(stats_map)
         self.assertEqual(len(classified), 0)
 
     def test_one_run_skipped(self):
         runs = self._create_runs("test_1run", 1)
         stats_map = self.classifier.aggregate_stats(runs)
-        classified = self.classifier.classify(stats_map)
+        classified, _ = self.classifier.classify(stats_map)
         self.assertEqual(len(classified), 0)
 
     def test_two_runs_skipped(self):
         runs = self._create_runs("test_2runs", 2)
         stats_map = self.classifier.aggregate_stats(runs)
-        classified = self.classifier.classify(stats_map)
+        classified, _ = self.classifier.classify(stats_map)
         self.assertEqual(len(classified), 0)
 
     def test_three_runs_included(self):
         runs = self._create_runs("test_3runs", 3)
         stats_map = self.classifier.aggregate_stats(runs)
-        classified = self.classifier.classify(stats_map)
+        classified, _ = self.classifier.classify(stats_map)
         self.assertEqual(len(classified), 1)
 
     def test_mixed_runs_some_skipped(self):
@@ -958,7 +959,7 @@ class TestMinRunsSkip(unittest.TestCase):
 
         all_runs = runs_3 + runs_2
         stats_map = self.classifier.aggregate_stats(all_runs)
-        classified = self.classifier.classify(stats_map)
+        classified, _ = self.classifier.classify(stats_map)
 
         names = [c.stats.name for c in classified]
         self.assertIn("test_enough", names)
@@ -1007,6 +1008,305 @@ class TestFailRatioEdgeCases(unittest.TestCase):
         )
         score = self.classifier._calculate_flaky_score(stats)
         self.assertEqual(score, 0.0)
+
+
+class TestTokenRefreshFallback(unittest.TestCase):
+    """Test token refresh fallback to original token on failure."""
+
+    def test_refresh_failure_falls_back_to_original(self):
+        call_count = 0
+
+        def bad_refresh():
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("Refresh service unavailable")
+
+        config = HTTPConfig(
+            bearer_token="original-token",
+            token_refresh_fn=bad_refresh,
+            max_refresh_retries=1,
+        )
+
+        self.assertTrue(config.can_refresh_token())
+        self.assertEqual(config.bearer_token, "original-token")
+
+    def test_original_token_preserved_after_bad_refresh_config(self):
+        config = HTTPConfig(
+            bearer_token="my-original",
+            token_refresh_fn=lambda: (_ for _ in ()).throw(RuntimeError("fail")),
+            max_refresh_retries=1,
+        )
+        self.assertEqual(config.bearer_token, "my-original")
+
+
+class TestWeightsTolerance(unittest.TestCase):
+    """Test weight tolerance configuration."""
+
+    def test_custom_tolerance_passes(self):
+        weights = WeightsConfig(
+            fail_rate_weight=0.50,
+            transition_weight=0.35,
+            recency_weight=0.16,
+        )
+        weights.validate(auto_normalize=False, tolerance=0.02)
+
+    def test_custom_tolerance_fails(self):
+        weights = WeightsConfig(
+            fail_rate_weight=0.5,
+            transition_weight=0.5,
+            recency_weight=0.5,
+        )
+        with self.assertRaises(ValueError):
+            weights.validate(auto_normalize=False, tolerance=0.02)
+
+    def test_classifier_with_weight_tolerance(self):
+        weights = WeightsConfig(
+            fail_rate_weight=0.50,
+            transition_weight=0.35,
+            recency_weight=0.16,
+        )
+        classifier = TestCaseClassifier(
+            weights=weights,
+            auto_normalize_weights=False,
+            weight_tolerance=0.02,
+        )
+        self.assertAlmostEqual(
+            classifier.weights.fail_rate_weight +
+            classifier.weights.transition_weight +
+            classifier.weights.recency_weight,
+            1.01,
+            places=2,
+        )
+
+    def test_normalize_with_tolerance(self):
+        weights = WeightsConfig(
+            fail_rate_weight=5.0,
+            transition_weight=3.0,
+            recency_weight=2.0,
+        )
+        weights.normalize(tolerance=0.01)
+        self.assertAlmostEqual(weights.fail_rate_weight, 0.5)
+
+
+class TestSkippedTestsMetadata(unittest.TestCase):
+    """Test skipped tests metadata in classify and JSON output."""
+
+    def setUp(self):
+        self.classifier = TestCaseClassifier(min_runs=3)
+
+    def _create_runs(self, test_name: str, count: int) -> List[TestRun]:
+        runs = []
+        for i in range(count):
+            run = TestRun(
+                run_id=f"run_{i:03d}",
+                timestamp=f"2026-06-{10+i:02d}T10:00:00",
+                results=[
+                    TestResult(
+                        name=test_name,
+                        status=TestStatus.PASSED,
+                        file="test.py",
+                        team="team",
+                    )
+                ],
+            )
+            runs.append(run)
+        return runs
+
+    def test_classify_returns_skipped_tests(self):
+        runs_ok = self._create_runs("test_enough", 3)
+        runs_short = self._create_runs("test_short", 2)
+
+        all_runs = runs_ok + runs_short
+        stats_map = self.classifier.aggregate_stats(all_runs)
+        classified, skipped = self.classifier.classify(stats_map)
+
+        self.assertEqual(len(classified), 1)
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0].name, "test_short")
+        self.assertEqual(skipped[0].total_runs, 2)
+        self.assertEqual(skipped[0].min_runs_required, 3)
+        self.assertEqual(skipped[0].reason, "insufficient_runs")
+
+    def test_skipped_test_has_metadata(self):
+        runs = self._create_runs("test_meta", 1)
+        stats_map = self.classifier.aggregate_stats(runs)
+        _, skipped = self.classifier.classify(stats_map)
+
+        self.assertEqual(len(skipped), 1)
+        st = skipped[0]
+        self.assertEqual(st.name, "test_meta")
+        self.assertEqual(st.file, "test.py")
+        self.assertEqual(st.team, "team")
+        self.assertEqual(st.total_runs, 1)
+        self.assertEqual(st.min_runs_required, 3)
+        self.assertEqual(st.passed, 1)
+        self.assertEqual(st.failed, 0)
+        self.assertEqual(st.skipped, 0)
+
+    def test_skipped_tests_in_json_output(self):
+        runs = self._create_runs("test_enough", 3) + self._create_runs("test_short", 2)
+        summarizer = SummaryGenerator(classifier=self.classifier)
+        report = summarizer.generate_report(runs)
+
+        json_str = OutputFormatter.format_json(report)
+        data = json.loads(json_str)
+
+        self.assertIn("skipped_tests", data)
+        self.assertEqual(len(data["skipped_tests"]), 1)
+        st = data["skipped_tests"][0]
+        self.assertEqual(st["name"], "test_short")
+        self.assertEqual(st["total_runs"], 2)
+        self.assertEqual(st["min_runs_required"], 3)
+        self.assertIn("reason", st)
+        self.assertEqual(st["reason"], "insufficient_runs")
+        self.assertIn("passed", st)
+        self.assertIn("failed", st)
+        self.assertIn("skipped_count", st)
+
+    def test_no_skipped_when_all_meet_min_runs(self):
+        runs = self._create_runs("test_enough", 5)
+        summarizer = SummaryGenerator(classifier=self.classifier)
+        report = summarizer.generate_report(runs)
+
+        json_str = OutputFormatter.format_json(report)
+        data = json.loads(json_str)
+
+        self.assertIn("skipped_tests", data)
+        self.assertEqual(len(data["skipped_tests"]), 0)
+
+    def test_skipped_test_model_fields(self):
+        st = SkippedTestCase(
+            name="test",
+            file="f.py",
+            team="t",
+            total_runs=1,
+            min_runs_required=3,
+            passed=0,
+            failed=1,
+            skipped=0,
+            reason="insufficient_runs",
+        )
+        self.assertEqual(st.name, "test")
+        self.assertEqual(st.total_runs, 1)
+        self.assertEqual(st.reason, "insufficient_runs")
+
+
+class TestCrossYearTimestamps(unittest.TestCase):
+    """Test cross-year ISO week timestamp parsing."""
+
+    def test_parse_2020_w53(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        dt = _parse_timestamp("2020-W53-1")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2020)
+        self.assertEqual(dt.month, 12)
+        self.assertEqual(dt.day, 28)
+
+    def test_parse_2021_w01(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        dt = _parse_timestamp("2021-W01-1")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2021)
+        self.assertEqual(dt.month, 1)
+        self.assertEqual(dt.day, 4)
+
+    def test_2020_w53_and_2021_w01_not_overlapping(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        w53 = _parse_timestamp("2020-W53-1")
+        w01 = _parse_timestamp("2021-W01-1")
+        self.assertIsNotNone(w53)
+        self.assertIsNotNone(w01)
+        self.assertLess(w53, w01)
+
+    def test_invalid_week_returns_none(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        self.assertIsNone(_parse_timestamp("2025-W53-1"))
+
+    def test_2025_12_31_belongs_to_2026_w01(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        dt = _parse_timestamp("2026-W01-1")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.month, 12)
+        self.assertEqual(dt.day, 29)
+
+
+class TestSchemaDowngrade(unittest.TestCase):
+    """Test schema downgrade and upgrade paths."""
+
+    def test_downgrade_1_1_to_1_0(self):
+        from flake_summary.cli import main
+
+        sample_dir = os.path.join(os.path.dirname(__file__), "sample_data")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            temp_file = f.name
+
+        try:
+            main(["--dir", sample_dir, "--format", "json", "--output", temp_file])
+
+            with open(temp_file) as f:
+                data = json.load(f)
+
+            self.assertEqual(data["schema_version"], "1.1.0")
+            self.assertIn("skipped_tests", data)
+            self.assertIn("fail_ratio_pct", data["classified_tests"][0])
+
+            for ct in data["classified_tests"]:
+                ct["recent_consecutive_failures"] = ct.pop("fail_ratio_pct", 0)
+                ct.pop("total_runs", None)
+
+            data.pop("schema_version", None)
+            data.pop("tool_version", None)
+            data.pop("skipped_tests", None)
+
+            self.assertNotIn("schema_version", data)
+            self.assertNotIn("skipped_tests", data)
+            self.assertIn("recent_consecutive_failures", data["classified_tests"][0])
+        finally:
+            os.unlink(temp_file)
+
+    def test_upgrade_1_0_to_1_1(self):
+        v1_0_data = {
+            "total_runs": 5,
+            "total_test_cases": 3,
+            "overall_flaky_rate": 33.3,
+            "categories": {"flaky": 1, "stable_pass": 2},
+            "classified_tests": [
+                {
+                    "name": "test_a",
+                    "file": "f.py",
+                    "team": "t",
+                    "category": "flaky",
+                    "flaky_score": 50.0,
+                    "passed": 3,
+                    "failed": 2,
+                    "skipped": 0,
+                    "pass_rate": 60.0,
+                    "fail_rate": 40.0,
+                    "recent_consecutive_failures": 40,
+                    "history": ["passed", "failed", "passed", "failed", "passed"],
+                }
+            ],
+            "team_summaries": [],
+            "file_summaries": [],
+        }
+
+        if "schema_version" not in v1_0_data:
+            v1_0_data["schema_version"] = "1.1.0"
+            v1_0_data["tool_version"] = "0.0.0"
+            v1_0_data["skipped_tests"] = []
+            for ct in v1_0_data.get("classified_tests", []):
+                ct["fail_ratio_pct"] = ct.pop("recent_consecutive_failures", 0)
+                ct["total_runs"] = ct["passed"] + ct["failed"] + ct.get("skipped", 0)
+
+        self.assertEqual(v1_0_data["schema_version"], "1.1.0")
+        self.assertIn("skipped_tests", v1_0_data)
+        self.assertIn("fail_ratio_pct", v1_0_data["classified_tests"][0])
+        self.assertEqual(v1_0_data["classified_tests"][0]["total_runs"], 5)
 
 
 if __name__ == "__main__":

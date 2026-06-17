@@ -60,6 +60,7 @@ class TestResultParser:
     def _parse_url(url: str, http_config: Optional[HTTPConfig] = None) -> TestRun:
         http_config = http_config or HTTPConfig()
         current_token = http_config.bearer_token
+        original_token = http_config.bearer_token
         refresh_attempts = 0
 
         while True:
@@ -69,10 +70,17 @@ class TestResultParser:
                 return TestResultParser._parse_content(content, run_id)
             except HTTPError as e:
                 if e.code in (401, 403) and http_config.can_refresh_token() and refresh_attempts < http_config.max_refresh_retries:
-                    current_token = http_config.token_refresh_fn()
-                    http_config.bearer_token = current_token
-                    refresh_attempts += 1
-                    continue
+                    try:
+                        new_token = http_config.token_refresh_fn()
+                        current_token = new_token
+                        http_config.bearer_token = new_token
+                        refresh_attempts += 1
+                        continue
+                    except Exception:
+                        http_config.bearer_token = original_token
+                        current_token = original_token
+                        refresh_attempts = http_config.max_refresh_retries
+                        continue
                 raise
             except URLError:
                 raise

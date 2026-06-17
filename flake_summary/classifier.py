@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 
 from .models import (
     ClassifiedTestCase,
+    SkippedTestCase,
     TestCategory,
     TestCaseStats,
     TestRun,
@@ -83,7 +84,7 @@ class WeightsConfig:
             data = json.load(f)
         return cls.from_dict(data)
 
-    def validate(self, auto_normalize: bool = False) -> None:
+    def validate(self, auto_normalize: bool = False, tolerance: float = 0.001) -> None:
         if self.fail_rate_weight < 0 or self.transition_weight < 0 or self.recency_weight < 0:
             raise ValueError("All weights must be non-negative")
         if self.recency_window_size < 1:
@@ -93,21 +94,21 @@ class WeightsConfig:
         if total == 0:
             raise ValueError("Sum of weights must be greater than 0")
 
-        if auto_normalize and abs(total - 1.0) > 0.001:
+        if auto_normalize and abs(total - 1.0) > tolerance:
             self.fail_rate_weight /= total
             self.transition_weight /= total
             self.recency_weight /= total
-        elif abs(total - 1.0) > 0.001:
+        elif abs(total - 1.0) > tolerance:
             raise ValueError(
-                f"Weight sum must equal 1.0, got {total:.4f}. "
+                f"Weight sum must equal 1.0 (tolerance={tolerance}), got {total:.4f}. "
                 "Set auto_normalize=True to auto-normalize."
             )
 
-    def normalize(self) -> None:
+    def normalize(self, tolerance: float = 0.001) -> None:
         total = self.fail_rate_weight + self.transition_weight + self.recency_weight
         if total == 0:
             raise ValueError("Cannot normalize: sum of weights is zero")
-        if abs(total - 1.0) > 0.001:
+        if abs(total - 1.0) > tolerance:
             self.fail_rate_weight /= total
             self.transition_weight /= total
             self.recency_weight /= total
@@ -124,12 +125,13 @@ class TestCaseClassifier:
         weights: Optional[WeightsConfig] = None,
         time_window_days: Optional[int] = None,
         auto_normalize_weights: bool = True,
+        weight_tolerance: float = 0.001,
     ):
         self.min_runs = min_runs
         self.stable_pass_threshold = stable_pass_threshold
         self.fail_ratio_threshold = fail_ratio_threshold
         self.weights = weights or WeightsConfig()
-        self.weights.validate(auto_normalize=auto_normalize_weights)
+        self.weights.validate(auto_normalize=auto_normalize_weights, tolerance=weight_tolerance)
         self.time_window_days = time_window_days
 
     def filter_runs_by_time_window(self, test_runs: List[TestRun]) -> List[TestRun]:
@@ -182,11 +184,23 @@ class TestCaseClassifier:
 
     def classify(
         self, stats_map: Dict[str, TestCaseStats]
-    ) -> List[ClassifiedTestCase]:
+    ) -> tuple[List[ClassifiedTestCase], List[SkippedTestCase]]:
         classified = []
+        skipped = []
 
         for stats in stats_map.values():
             if stats.total_runs < self.min_runs:
+                skipped.append(SkippedTestCase(
+                    name=stats.name,
+                    file=stats.file,
+                    team=stats.team,
+                    total_runs=stats.total_runs,
+                    min_runs_required=self.min_runs,
+                    passed=stats.passed,
+                    failed=stats.failed,
+                    skipped=stats.skipped,
+                    reason="insufficient_runs",
+                ))
                 continue
 
             category, flaky_score, fail_ratio = self._classify_case(stats)
@@ -199,7 +213,7 @@ class TestCaseClassifier:
                 )
             )
 
-        return classified
+        return classified, skipped
 
     def _classify_case(
         self, stats: TestCaseStats

@@ -70,6 +70,19 @@ class ClassifiedTestCase:
 
 
 @dataclass
+class SkippedTestCase:
+    name: str
+    file: str
+    team: str
+    total_runs: int
+    min_runs_required: int
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    reason: str = "insufficient_runs"
+
+
+@dataclass
 class TeamSummary:
     team: str
     total_tests: int
@@ -99,3 +112,4 @@ class SummaryReport:
     team_summaries: List[TeamSummary]
     file_summaries: List[FileSummary]
     overall_flaky_rate: float
+    skipped_tests: List[SkippedTestCase] = field(default_factory=list)
