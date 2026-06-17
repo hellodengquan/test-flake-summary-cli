@@ -21,7 +21,8 @@ class SummaryGenerator:
         self.classifier = classifier or TestCaseClassifier()
 
     def generate_report(self, test_runs: List[TestRun]) -> SummaryReport:
-        stats_map = self.classifier.aggregate_stats(test_runs)
+        filtered_runs = self.classifier.filter_runs_by_time_window(test_runs)
+        stats_map = self.classifier.aggregate_stats(filtered_runs)
         classified_tests = self.classifier.classify(stats_map)
 
         categories: Dict[TestCategory, int] = defaultdict(int)
@@ -36,7 +37,7 @@ class SummaryGenerator:
         overall_flaky_rate = flaky_count / total_tests if total_tests > 0 else 0.0
 
         return SummaryReport(
-            total_runs=len(test_runs),
+            total_runs=len(filtered_runs),
             total_test_cases=total_tests,
             categories=dict(categories),
             classified_tests=classified_tests,

@@ -4,9 +4,10 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from typing import List
 
-from flake_summary.classifier import TestCaseClassifier
+from flake_summary.classifier import TestCaseClassifier, WeightsConfig
 from flake_summary.models import (
     TestCategory,
     TestResult,
@@ -14,7 +15,7 @@ from flake_summary.models import (
     TestStatus,
 )
 from flake_summary.output import OutputFormatter
-from flake_summary.parser import TestResultParser
+from flake_summary.parser import HTTPConfig, TestResultParser
 from flake_summary.summarizer import SummaryGenerator
 
 
@@ -49,6 +50,97 @@ class TestModels(unittest.TestCase):
         self.assertEqual(stats.total_runs, 0)
         self.assertEqual(stats.pass_rate, 0.0)
         self.assertEqual(stats.fail_rate, 0.0)
+
+
+class TestHTTPConfig(unittest.TestCase):
+    """Test HTTP configuration."""
+
+    def test_http_config_defaults(self):
+        config = HTTPConfig()
+        self.assertIsNone(config.basic_auth)
+        self.assertIsNone(config.bearer_token)
+        self.assertIsNone(config.proxy)
+        self.assertFalse(config.has_auth())
+
+    def test_http_config_basic_auth(self):
+        config = HTTPConfig(
+            basic_auth={"username": "user", "password": "pass"}
+        )
+        self.assertTrue(config.has_auth())
+        self.assertEqual(config.basic_auth["username"], "user")
+        self.assertEqual(config.basic_auth["password"], "pass")
+
+    def test_http_config_bearer_token(self):
+        config = HTTPConfig(bearer_token="my-secret-token")
+        self.assertTrue(config.has_auth())
+        self.assertEqual(config.bearer_token, "my-secret-token")
+
+    def test_http_config_proxy(self):
+        config = HTTPConfig(proxy={"http": "http://proxy:8080", "https": "http://proxy:8080"})
+        self.assertTrue(config.has_auth())
+        self.assertIn("http", config.proxy)
+
+    def test_http_config_custom_headers(self):
+        config = HTTPConfig(custom_headers={"X-Custom": "value"})
+        self.assertIn("X-Custom", config.custom_headers)
+        self.assertEqual(config.custom_headers["X-Custom"], "value")
+
+
+class TestWeightsConfig(unittest.TestCase):
+    """Test weights configuration."""
+
+    def test_weights_config_defaults(self):
+        weights = WeightsConfig()
+        self.assertEqual(weights.fail_rate_weight, 0.5)
+        self.assertEqual(weights.transition_weight, 0.3)
+        self.assertEqual(weights.recency_weight, 0.2)
+        self.assertEqual(weights.recency_window_size, 5)
+
+    def test_weights_config_from_dict(self):
+        data = {
+            "fail_rate_weight": 0.6,
+            "transition_weight": 0.2,
+            "recency_weight": 0.2,
+            "recency_window_size": 7,
+        }
+        weights = WeightsConfig.from_dict(data)
+        self.assertEqual(weights.fail_rate_weight, 0.6)
+        self.assertEqual(weights.recency_window_size, 7)
+
+    def test_weights_config_validate_valid(self):
+        weights = WeightsConfig()
+        weights.validate()
+
+    def test_weights_config_validate_invalid_sum(self):
+        weights = WeightsConfig(
+            fail_rate_weight=0.5,
+            transition_weight=0.5,
+            recency_weight=0.5,
+        )
+        with self.assertRaises(ValueError):
+            weights.validate()
+
+    def test_weights_config_validate_invalid_window(self):
+        weights = WeightsConfig(recency_window_size=0)
+        with self.assertRaises(ValueError):
+            weights.validate()
+
+    def test_weights_config_from_file(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({
+                "fail_rate_weight": 0.4,
+                "transition_weight": 0.4,
+                "recency_weight": 0.2,
+                "recency_window_size": 3,
+            }, f)
+            temp_file = f.name
+
+        try:
+            weights = WeightsConfig.from_file(temp_file)
+            self.assertEqual(weights.fail_rate_weight, 0.4)
+            self.assertEqual(weights.recency_window_size, 3)
+        finally:
+            os.unlink(temp_file)
 
 
 class TestParser(unittest.TestCase):
@@ -137,6 +229,17 @@ class TestParser(unittest.TestCase):
         runs = TestResultParser.parse_directory(self.temp_dir)
         self.assertEqual(len(runs), 3)
 
+    def test_parse_invalid_json_no_results(self):
+        json_content = json.dumps({
+            "not_results": [],
+        })
+        file_path = os.path.join(self.temp_dir, "invalid.json")
+        with open(file_path, "w") as f:
+            f.write(json_content)
+
+        with self.assertRaises(ValueError):
+            TestResultParser.parse_file(file_path)
+
 
 class TestClassifier(unittest.TestCase):
     """Test case classifier."""
@@ -145,7 +248,7 @@ class TestClassifier(unittest.TestCase):
         self.classifier = TestCaseClassifier(
             min_runs=3,
             stable_pass_threshold=0.95,
-            consecutive_fail_threshold=3,
+            fail_ratio_threshold=0.7,
         )
 
     def _create_test_runs(self, test_name: str, statuses: List[TestStatus]) -> List[TestRun]:
@@ -192,7 +295,7 @@ class TestClassifier(unittest.TestCase):
         self.assertEqual(classified[0].category, TestCategory.FLAKY)
         self.assertGreater(classified[0].flaky_score, 0)
 
-    def test_continuous_fail(self):
+    def test_continuous_fail_by_ratio(self):
         statuses = [
             TestStatus.PASSED,
             TestStatus.FAILED,
@@ -206,7 +309,22 @@ class TestClassifier(unittest.TestCase):
 
         self.assertEqual(len(classified), 1)
         self.assertEqual(classified[0].category, TestCategory.CONTINUOUS_FAIL)
-        self.assertEqual(classified[0].recent_consecutive_failures, 4)
+        self.assertEqual(classified[0].stats.fail_rate, 0.8)
+
+    def test_fail_ratio_threshold(self):
+        classifier = TestCaseClassifier(fail_ratio_threshold=0.5)
+        statuses = [
+            TestStatus.PASSED,
+            TestStatus.PASSED,
+            TestStatus.FAILED,
+            TestStatus.FAILED,
+            TestStatus.FAILED,
+        ]
+        runs = self._create_test_runs("test_ratio", statuses)
+        stats_map = classifier.aggregate_stats(runs)
+        classified = classifier.classify(stats_map)
+
+        self.assertEqual(classified[0].category, TestCategory.CONTINUOUS_FAIL)
 
     def test_all_failed(self):
         statuses = [TestStatus.FAILED] * 5
@@ -215,7 +333,7 @@ class TestClassifier(unittest.TestCase):
         classified = self.classifier.classify(stats_map)
 
         self.assertEqual(classified[0].category, TestCategory.CONTINUOUS_FAIL)
-        self.assertEqual(classified[0].recent_consecutive_failures, 5)
+        self.assertEqual(classified[0].stats.fail_rate, 1.0)
 
     def test_insufficient_runs(self):
         statuses = [TestStatus.FAILED, TestStatus.PASSED]
@@ -241,6 +359,29 @@ class TestClassifier(unittest.TestCase):
         self.assertGreater(score, 0)
         self.assertLessEqual(score, 100)
 
+    def test_flaky_score_with_custom_weights(self):
+        weights = WeightsConfig(
+            fail_rate_weight=0.8,
+            transition_weight=0.1,
+            recency_weight=0.1,
+        )
+        classifier = TestCaseClassifier(weights=weights)
+
+        statuses = [
+            TestStatus.PASSED,
+            TestStatus.FAILED,
+            TestStatus.PASSED,
+            TestStatus.FAILED,
+            TestStatus.PASSED,
+        ]
+        runs = self._create_test_runs("test_custom_weights", statuses)
+        stats_map = classifier.aggregate_stats(runs)
+        stats = stats_map["test_file.py::test_custom_weights"]
+
+        score = classifier._calculate_flaky_score(stats)
+        self.assertGreater(score, 0)
+        self.assertLessEqual(score, 100)
+
     def test_consecutive_failures_with_skipped(self):
         statuses = [
             TestStatus.PASSED,
@@ -253,7 +394,47 @@ class TestClassifier(unittest.TestCase):
         stats_map = self.classifier.aggregate_stats(runs)
         classified = self.classifier.classify(stats_map)
 
-        self.assertEqual(classified[0].recent_consecutive_failures, 2)
+        self.assertEqual(classified[0].stats.fail_rate, 0.6)
+        self.assertEqual(classified[0].recent_consecutive_failures, 60)
+
+    def test_time_window_filtering(self):
+        old_date = (datetime.now() - timedelta(days=60)).isoformat()
+        new_date = (datetime.now() - timedelta(days=5)).isoformat()
+
+        runs = [
+            TestRun(
+                run_id="old_run",
+                timestamp=old_date,
+                results=[TestResult(
+                    name="test_tw",
+                    status=TestStatus.FAILED,
+                    file="test.py",
+                    team="team",
+                )],
+            ),
+            TestRun(
+                run_id="new_run",
+                timestamp=new_date,
+                results=[TestResult(
+                    name="test_tw",
+                    status=TestStatus.PASSED,
+                    file="test.py",
+                    team="team",
+                )],
+            ),
+        ]
+
+        classifier = TestCaseClassifier(time_window_days=30)
+        filtered = classifier.filter_runs_by_time_window(runs)
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].run_id, "new_run")
+
+    def test_time_window_none(self):
+        runs = self._create_test_runs("test", [TestStatus.PASSED] * 3)
+        classifier = TestCaseClassifier(time_window_days=None)
+        filtered = classifier.filter_runs_by_time_window(runs)
+        self.assertEqual(len(filtered), 3)
 
 
 class TestSummarizer(unittest.TestCase):
@@ -339,6 +520,49 @@ class TestSummarizer(unittest.TestCase):
         self.assertEqual(report.total_test_cases, 2)
         self.assertGreater(report.overall_flaky_rate, 0)
 
+    def test_time_window_in_summarizer(self):
+        old_date = (datetime.now() - timedelta(days=60)).isoformat()
+        new_date = (datetime.now() - timedelta(days=5)).isoformat()
+
+        runs = [
+            TestRun(
+                run_id="old",
+                timestamp=old_date,
+                results=[TestResult(
+                    name="test",
+                    status=TestStatus.FAILED,
+                    file="test.py",
+                    team="team",
+                )],
+            ),
+            TestRun(
+                run_id="new1",
+                timestamp=new_date,
+                results=[TestResult(
+                    name="test",
+                    status=TestStatus.PASSED,
+                    file="test.py",
+                    team="team",
+                )],
+            ),
+            TestRun(
+                run_id="new2",
+                timestamp=new_date,
+                results=[TestResult(
+                    name="test",
+                    status=TestStatus.PASSED,
+                    file="test.py",
+                    team="team",
+                )],
+            ),
+        ]
+
+        classifier = TestCaseClassifier(time_window_days=30)
+        summarizer = SummaryGenerator(classifier=classifier)
+        report = summarizer.generate_report(runs)
+
+        self.assertEqual(report.total_runs, 2)
+
 
 class TestOutputFormatter(unittest.TestCase):
     """Output formatter tests."""
@@ -365,7 +589,24 @@ class TestOutputFormatter(unittest.TestCase):
         summarizer = SummaryGenerator()
         self.report = summarizer.generate_report(runs)
 
-    def test_json_output(self):
+    def test_json_output_has_version(self):
+        json_str = OutputFormatter.format_json(self.report)
+        data = json.loads(json_str)
+
+        self.assertIn("schema_version", data)
+        self.assertIn("tool_version", data)
+        self.assertEqual(data["schema_version"], "1.1.0")
+        self.assertEqual(data["tool_version"], "1.0.0")
+
+    def test_json_output_has_fail_ratio_pct(self):
+        json_str = OutputFormatter.format_json(self.report)
+        data = json.loads(json_str)
+
+        test_data = data["classified_tests"][0]
+        self.assertIn("fail_ratio_pct", test_data)
+        self.assertNotIn("recent_consecutive_failures", test_data)
+
+    def test_json_output_structure(self):
         json_str = OutputFormatter.format_json(self.report)
         data = json.loads(json_str)
 
@@ -382,6 +623,8 @@ class TestOutputFormatter(unittest.TestCase):
         self.assertIn("BY TEAM SUMMARY", text)
         self.assertIn("BY FILE SUMMARY", text)
         self.assertIn("TEST CASE DETAILS", text)
+        self.assertIn("Pass%", text)
+        self.assertIn("Fail%", text)
 
     def test_text_output_show_only_flaky(self):
         text = OutputFormatter.format_text_table(self.report, show_only_flaky=True)
@@ -407,10 +650,45 @@ class TestCLI(unittest.TestCase):
         args = parser.parse_args(["--dir", "test_dir"])
         self.assertEqual(args.dir, "test_dir")
         self.assertEqual(args.format, "text")
+        self.assertEqual(args.fail_ratio, 0.7)
 
         args = parser.parse_args(["--files", "a.xml", "b.xml", "--format", "json"])
         self.assertEqual(args.files, ["a.xml", "b.xml"])
         self.assertEqual(args.format, "json")
+
+    def test_cli_has_http_options(self):
+        from flake_summary.cli import build_arg_parser
+
+        parser = build_arg_parser()
+        args = parser.parse_args([
+            "--dir", "test",
+            "--basic-auth-user", "user",
+            "--basic-auth-pass", "pass",
+            "--bearer-token", "token",
+            "--proxy", "http://proxy:8080",
+        ])
+        self.assertEqual(args.basic_auth_user, "user")
+        self.assertEqual(args.basic_auth_pass, "pass")
+        self.assertEqual(args.bearer_token, "token")
+        self.assertEqual(args.proxy, "http://proxy:8080")
+
+    def test_cli_has_classification_options(self):
+        from flake_summary.cli import build_arg_parser
+
+        parser = build_arg_parser()
+        args = parser.parse_args([
+            "--dir", "test",
+            "--min-runs", "5",
+            "--stable-threshold", "0.9",
+            "--fail-ratio", "0.6",
+            "--weights", "weights.json",
+            "--time-window", "7",
+        ])
+        self.assertEqual(args.min_runs, 5)
+        self.assertEqual(args.stable_threshold, 0.9)
+        self.assertEqual(args.fail_ratio, 0.6)
+        self.assertEqual(args.weights, "weights.json")
+        self.assertEqual(args.time_window, 7)
 
     def test_main_with_sample_data(self):
         from flake_summary.cli import main
@@ -445,10 +723,54 @@ class TestCLI(unittest.TestCase):
 
             with open(temp_file) as f:
                 data = json.load(f)
+            self.assertIn("schema_version", data)
             self.assertIn("total_runs", data)
             self.assertEqual(data["total_runs"], 5)
         finally:
             os.unlink(temp_file)
+
+    def test_main_with_weights(self):
+        from flake_summary.cli import main
+
+        sample_dir = os.path.join(
+            os.path.dirname(__file__),
+            "sample_data",
+        )
+        weights_file = os.path.join(sample_dir, "weights_config.json")
+
+        exit_code = main([
+            "--dir", sample_dir,
+            "--weights", weights_file,
+        ])
+        self.assertEqual(exit_code, 0)
+
+    def test_main_with_time_window(self):
+        from flake_summary.cli import main
+
+        sample_dir = os.path.join(
+            os.path.dirname(__file__),
+            "sample_data",
+        )
+
+        exit_code = main([
+            "--dir", sample_dir,
+            "--time-window", "30",
+        ])
+        self.assertEqual(exit_code, 0)
+
+    def test_main_with_fail_ratio(self):
+        from flake_summary.cli import main
+
+        sample_dir = os.path.join(
+            os.path.dirname(__file__),
+            "sample_data",
+        )
+
+        exit_code = main([
+            "--dir", sample_dir,
+            "--fail-ratio", "0.5",
+        ])
+        self.assertEqual(exit_code, 0)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import json
 from dataclasses import asdict
 from typing import List
 
+from . import __version__
 from .models import (
     ClassifiedTestCase,
     FileSummary,
@@ -17,9 +18,13 @@ from .models import (
 class OutputFormatter:
     """Formats summary reports for output."""
 
+    SCHEMA_VERSION = "1.1.0"
+
     @staticmethod
     def format_json(report: SummaryReport, indent: int = 2) -> str:
         data = {
+            "schema_version": OutputFormatter.SCHEMA_VERSION,
+            "tool_version": __version__,
             "total_runs": report.total_runs,
             "total_test_cases": report.total_test_cases,
             "overall_flaky_rate": report.overall_flaky_rate,
@@ -50,7 +55,7 @@ class OutputFormatter:
             "total_runs": ct.stats.total_runs,
             "pass_rate": round(ct.stats.pass_rate * 100, 2),
             "fail_rate": round(ct.stats.fail_rate * 100, 2),
-            "recent_consecutive_failures": ct.recent_consecutive_failures,
+            "fail_ratio_pct": ct.recent_consecutive_failures,
             "history": [h.value for h in ct.stats.history],
         }
 
@@ -167,7 +172,7 @@ class OutputFormatter:
 
         header = (
             f"{'Test Name':<50} {'Category':<16} {'Score':>6} "
-            f"{'P/F/S':>9} {'Rate':>7} {'History':<15}"
+            f"{'P/F/S':>9} {'Pass%':>7} {'Fail%':>7} {'History':<15}"
         )
         separator = "-" * len(header)
         lines = [header, separator]
@@ -179,13 +184,14 @@ class OutputFormatter:
 
             category_display = OutputFormatter._get_category_display(ct.category)
             pfs_display = f"{ct.stats.passed}/{ct.stats.failed}/{ct.stats.skipped}"
-            rate_display = f"{ct.stats.pass_rate * 100:>5.1f}%"
+            pass_rate_display = f"{ct.stats.pass_rate * 100:>5.1f}%"
+            fail_rate_display = f"{ct.stats.fail_rate * 100:>5.1f}%"
             history_display = OutputFormatter._format_history(ct.stats.history)
 
             lines.append(
                 f"{name_display:<50} {category_display:<16} "
                 f"{ct.flaky_score:>5.1f} {pfs_display:>9} "
-                f"{rate_display:>7} {history_display:<15}"
+                f"{pass_rate_display:>7} {fail_rate_display:>7} {history_display:<15}"
             )
 
         return "\n".join(lines)

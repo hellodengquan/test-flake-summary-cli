@@ -1,0 +1,6 @@
+{
+  "fail_rate_weight": 0.5,
+  "transition_weight": 0.3,
+  "recency_weight": 0.2,
+  "recency_window_size": 5
+}

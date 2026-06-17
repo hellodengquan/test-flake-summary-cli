@@ -1,29 +1,85 @@
 """Test result parser - supports JUnit XML format from CI systems."""
 
+import base64
 import json
 import os
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.request import (
+    HTTPBasicAuthHandler,
+    HTTPPasswordMgrWithDefaultRealm,
+    ProxyHandler,
+    Request,
+    build_opener,
+    install_opener,
+    urlopen,
+)
 
 from .models import TestResult, TestRun, TestStatus
+
+
+@dataclass
+class HTTPConfig:
+    """Configuration for HTTP requests."""
+
+    basic_auth: Optional[Dict[str, str]] = None
+    bearer_token: Optional[str] = None
+    proxy: Optional[Dict[str, str]] = None
+    custom_headers: Dict[str, str] = field(default_factory=dict)
+
+    def has_auth(self) -> bool:
+        return (
+            self.basic_auth is not None
+            or self.bearer_token is not None
+            or self.proxy is not None
+        )
 
 
 class TestResultParser:
     """Parser for test result files from CI systems."""
 
     @staticmethod
-    def parse_file(file_path: str) -> TestRun:
+    def parse_file(file_path: str, http_config: Optional[HTTPConfig] = None) -> TestRun:
         parsed = urlparse(file_path)
         if parsed.scheme in ("http", "https"):
-            return TestResultParser._parse_url(file_path)
+            return TestResultParser._parse_url(file_path, http_config)
         return TestResultParser._parse_local_file(file_path)
 
     @staticmethod
-    def _parse_url(url: str) -> TestRun:
-        with urlopen(url) as response:
+    def _parse_url(url: str, http_config: Optional[HTTPConfig] = None) -> TestRun:
+        http_config = http_config or HTTPConfig()
+
+        headers = {}
+        handlers = []
+
+        if http_config.basic_auth:
+            username = http_config.basic_auth.get("username", "")
+            password = http_config.basic_auth.get("password", "")
+            credentials = base64.b64encode(
+                f"{username}:{password}".encode()
+            ).decode("ascii")
+            headers["Authorization"] = f"Basic {credentials}"
+
+        if http_config.bearer_token:
+            headers["Authorization"] = f"Bearer {http_config.bearer_token}"
+
+        if http_config.custom_headers:
+            headers.update(http_config.custom_headers)
+
+        if http_config.proxy:
+            proxy_handler = ProxyHandler(http_config.proxy)
+            handlers.append(proxy_handler)
+
+        request = Request(url, headers=headers)
+
+        if handlers:
+            opener = build_opener(*handlers)
+            install_opener(opener)
+
+        with urlopen(request) as response:
             content = response.read()
             run_id = os.path.basename(urlparse(url).path) or url
             return TestResultParser._parse_content(content, run_id)
@@ -37,15 +93,23 @@ class TestResultParser:
 
     @staticmethod
     def _parse_content(content: bytes, run_id: str) -> TestRun:
+        test_run = None
         try:
-            return TestResultParser._parse_junit_xml(content, run_id)
+            test_run = TestResultParser._parse_junit_xml(content, run_id)
         except ET.ParseError:
             try:
-                return TestResultParser._parse_json(content, run_id)
+                test_run = TestResultParser._parse_json(content, run_id)
             except json.JSONDecodeError:
                 raise ValueError(
                     f"Unsupported format for run {run_id}. Expected JUnit XML or JSON."
                 )
+
+        if test_run is None or len(test_run.results) == 0:
+            raise ValueError(
+                f"No test results found in run {run_id}. Not a valid test result file."
+            )
+
+        return test_run
 
     @staticmethod
     def _parse_junit_xml(content: bytes, run_id: str) -> TestRun:
@@ -128,7 +192,10 @@ class TestResultParser:
         return test_run
 
     @staticmethod
-    def parse_directory(directory: str) -> List[TestRun]:
+    def parse_directory(
+        directory: str,
+        http_config: Optional[HTTPConfig] = None,
+    ) -> List[TestRun]:
         runs = []
         for filename in sorted(os.listdir(directory)):
             filepath = os.path.join(directory, filename)
@@ -136,17 +203,20 @@ class TestResultParser:
                 filename.endswith(".xml") or filename.endswith(".json")
             ):
                 try:
-                    runs.append(TestResultParser.parse_file(filepath))
+                    runs.append(TestResultParser.parse_file(filepath, http_config))
                 except (ValueError, ET.ParseError, json.JSONDecodeError):
                     continue
         return runs
 
     @staticmethod
-    def parse_files(file_paths: List[str]) -> List[TestRun]:
+    def parse_files(
+        file_paths: List[str],
+        http_config: Optional[HTTPConfig] = None,
+    ) -> List[TestRun]:
         runs = []
         for path in file_paths:
             try:
-                runs.append(TestResultParser.parse_file(path))
+                runs.append(TestResultParser.parse_file(path, http_config))
             except Exception as e:
                 print(f"Warning: Failed to parse {path}: {e}")
         return runs
