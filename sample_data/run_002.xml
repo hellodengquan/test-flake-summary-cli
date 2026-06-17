@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="CI_Run_002" tests="8" failures="1" errors="0" skipped="1" timestamp="2026-06-11T10:00:00">
+  <testsuite name="auth_tests" tests="3" failures="0" errors="0" skipped="0">
+    <testcase name="test_login_success" classname="AuthTest" file="tests/test_auth.py" team="backend" time="0.11"/>
+    <testcase name="test_login_invalid_credentials" classname="AuthTest" file="tests/test_auth.py" team="backend" time="0.09"/>
+    <testcase name="test_logout" classname="AuthTest" file="tests/test_auth.py" team="backend" time="0.06"/>
+  </testsuite>
+  <testsuite name="payment_tests" tests="3" failures="1" errors="0" skipped="1">
+    <testcase name="test_process_payment" classname="PaymentTest" file="tests/test_payment.py" team="payments" time="1.18"/>
+    <testcase name="test_refund" classname="PaymentTest" file="tests/test_payment.py" team="payments" time="0.42">
+      <failure message="AssertionError: Refund amount mismatch"/>
+    </testcase>
+    <testcase name="test_payment_history" classname="PaymentTest" file="tests/test_payment.py" team="payments" time="0.25">
+      <skipped message="Requires payment gateway mock"/>
+    </testcase>
+  </testsuite>
+  <testsuite name="user_tests" tests="2" failures="0" errors="0" skipped="0">
+    <testcase name="test_create_user" classname="UserTest" file="tests/test_user.py" team="user-profile" time="0.14"/>
+    <testcase name="test_update_profile" classname="UserTest" file="tests/test_user.py" team="user-profile" time="0.12"/>
+  </testsuite>
+</testsuites>

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="CI_Run_004" tests="8" failures="3" errors="0" skipped="0" timestamp="2026-06-13T10:00:00">
+  <testsuite name="auth_tests" tests="3" failures="1" errors="0" skipped="0">
+    <testcase name="test_login_success" classname="AuthTest" file="tests/test_auth.py" team="backend" time="0.14"/>
+    <testcase name="test_login_invalid_credentials" classname="AuthTest" file="tests/test_auth.py" team="backend" time="0.08">
+      <failure message="AssertionError: Expected 401, got 200"/>
+    </testcase>
+    <testcase name="test_logout" classname="AuthTest" file="tests/test_auth.py" team="backend" time="0.06"/>
+  </testsuite>
+  <testsuite name="payment_tests" tests="3" failures="2" errors="0" skipped="0">
+    <testcase name="test_process_payment" classname="PaymentTest" file="tests/test_payment.py" team="payments" time="1.22">
+      <failure message="TimeoutError: Payment gateway not responding"/>
+    </testcase>
+    <testcase name="test_refund" classname="PaymentTest" file="tests/test_payment.py" team="payments" time="0.46">
+      <failure message="NetworkError: Connection reset"/>
+    </testcase>
+    <testcase name="test_payment_history" classname="PaymentTest" file="tests/test_payment.py" team="payments" time="0.24">
+      <failure message="DatabaseError: Connection refused"/>
+    </testcase>
+  </testsuite>
+  <testsuite name="user_tests" tests="2" failures="0" errors="0" skipped="0">
+    <testcase name="test_create_user" classname="UserTest" file="tests/test_user.py" team="user-profile" time="0.15"/>
+    <testcase name="test_update_profile" classname="UserTest" file="tests/test_user.py" team="user-profile" time="0.11"/>
+  </testsuite>
+</testsuites>
