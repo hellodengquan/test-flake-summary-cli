@@ -43,6 +43,7 @@ class TestCaseStats:
     failed: int = 0
     skipped: int = 0
     history: List[TestStatus] = field(default_factory=list)
+    sample_run_ids: List[str] = field(default_factory=list)
 
     @property
     def total_runs(self) -> int:
@@ -80,6 +81,8 @@ class SkippedTestCase:
     failed: int = 0
     skipped: int = 0
     reason: str = "insufficient_runs"
+    skipped_sample_ids: List[str] = field(default_factory=list)
+    skip_reason: str = ""
 
 
 @dataclass

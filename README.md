@@ -5,33 +5,27 @@
 ## 功能特性
 
 - 支持 JUnit XML 和 JSON 格式的测试结果
-- HTTP/HTTPS 远程拉取，支持多种认证方式及 Token 自动刷新
+- HTTP/HTTPS 远程拉取，支持多种认证方式及 Token 自动刷新链
 - 智能分类：稳定通过、偶发抖动、连续失败
 - 按团队和文件分组统计
-- 可配置的权重评分算法（容差可调）
+- 可配置的权重评分算法（三档容差预设）
 - 时间窗口筛选历史数据（兼容跨年 ISO week）
 - 文本表格和 JSON 两种输出格式
-- 被跳过样本 metadata 输出，方便下游 dashboard
+- 被跳过样本 metadata 输出（含 sample IDs），方便下游 dashboard
 
 ## 安装
 
 要求 Python 3.8+，仅使用标准库，无需额外依赖。
 
 ```bash
-# 克隆后直接使用
 python -m flake_summary --help
 ```
 
 ## 快速开始
 
 ```bash
-# 从本地目录分析
 python -m flake_summary --dir sample_data/
-
-# 从远程 URL 分析
 python -m flake_summary --files https://ci.example.com/results/run.xml --bearer-token YOUR_TOKEN
-
-# JSON 格式输出
 python -m flake_summary --dir sample_data/ --format json --output report.json
 ```
 
@@ -83,8 +77,6 @@ python -m flake_summary --dir sample_data/ --format json --output report.json
 
 ### 版本字段
 
-JSON 输出包含两个版本字段：
-
 ```json
 {
   "schema_version": "1.1.0",
@@ -96,7 +88,7 @@ JSON 输出包含两个版本字段：
 - `schema_version`: JSON 输出结构的版本号，结构变更时递增
 - `tool_version`: 工具本身的版本号
 
-### 版本历史与迁移指南
+### 版本历史
 
 #### v1.1.0（当前）
 
@@ -105,17 +97,11 @@ JSON 输出包含两个版本字段：
 - `tool_version`: 标识工具版本
 - `fail_ratio_pct`: 失败百分比（整数）
 - `total_runs`: 每个用例的总运行次数字段
-- `skipped_tests`: 被跳过用例的 metadata 列表，包含 name / file / team / total_runs / min_runs_required / passed / failed / skipped_count / reason
+- `skipped_tests`: 被跳过用例的 metadata 列表，含 name / file / team / total_runs / min_runs_required / passed / failed / skipped_count / reason / skipped_sample_ids / skip_reason
 
 **变更说明：**
-- `recent_consecutive_failures` 字段语义变更：从"连续失败次数"改为"失败比例百分比"，保留字段名以兼容旧代码
-- 运行次数不足 `min-runs` 的用例不再出现在 `classified_tests` 中，改为输出到 `skipped_tests`
-
-**从 v1.0.0 升级到 v1.1.0：**
-1. 检查 `schema_version` 字段以确定兼容性
-2. 若使用 `recent_consecutive_failures`，请迁移到使用 `fail_ratio_pct` 字段（语义相同）
-3. 若依赖不足 min-runs 的用例数据，改为从 `skipped_tests` 字段读取
-4. 下游 dashboard 可通过 `skipped_tests` 展示样本不足的用例及原因
+- `recent_consecutive_failures` 字段语义变更：从"连续失败次数"改为"失败比例百分比"
+- 运行次数不足 `min-runs` 的用例不再出现在 `classified_tests`，改为输出到 `skipped_tests`
 
 #### v1.0.0
 
@@ -129,13 +115,21 @@ JSON 输出包含两个版本字段：
 
 | v1.1.0 字段 | v1.0.0 处理方式 |
 |-------------|----------------|
-| `schema_version` | 忽略（v1.0.0 无此字段） |
-| `tool_version` | 忽略 |
+| `schema_version` | **必须删除**。v1.0.0 无此字段，保留会导致下游校验失败。降级时 `del data["schema_version"]` |
+| `tool_version` | **必须删除**。v1.0.0 无此字段。降级时 `del data["tool_version"]` |
 | `fail_ratio_pct` | 映射回 `recent_consecutive_failures`，值不变（整数百分比） |
-| `skipped_tests` | 忽略，或将 reason=insufficient_runs 的条目按原逻辑回填到 `classified_tests`，category 设为 `flaky`（如有失败）或 `stable_pass` |
-| `classified_tests[].total_runs` | 可从 passed + failed + skipped 推算 |
+| `skipped_tests` | 删除，或将条目回填到 `classified_tests`（category 设为 `flaky` 或 `stable_pass`） |
+| `classified_tests[].total_runs` | 删除，v1.0.0 可从 passed + failed + skipped 推算 |
+| `skipped_tests[].skipped_sample_ids` | **必须删除**。v1.0.0 无此字段 |
+| `skipped_tests[].skip_reason` | **必须删除**。v1.0.0 无此字段 |
 
-降级脚本示例：
+**schema_version 降级规则：**
+
+1. 若 `schema_version` 为 `"1.1.0"` → 直接删除字段
+2. 若 `schema_version` 为更高版本 → 先检查是否有不认识的字段，有则报警，无则降为 `"1.0.0"` 再删除
+3. 降级后的 JSON 不应包含任何 `schema_version` 或 `tool_version` 字段，因为 v1.0.0 不定义这些字段
+
+降级脚本：
 
 ```python
 import json
@@ -162,9 +156,9 @@ def downgrade_1_1_to_1_0(data: dict) -> dict:
             "history": [],
         }
         data["classified_tests"].append(entry)
-    data.pop("schema_version", None)
-    data.pop("tool_version", None)
-    data.pop("skipped_tests", None)
+    del data["schema_version"]
+    del data["tool_version"]
+    del data["skipped_tests"]
     return data
 ```
 
@@ -180,7 +174,7 @@ def downgrade_1_1_to_1_0(data: dict) -> dict:
 | 缺少 `skipped_tests` | 补充 `"skipped_tests": []` |
 | 缺少 `classified_tests[].total_runs` | 从 passed + failed + skipped 推算 |
 
-升级脚本示例：
+升级脚本：
 
 ```python
 def upgrade_1_0_to_1_1(data: dict) -> dict:
@@ -219,89 +213,108 @@ def upgrade_1_0_to_1_1(data: dict) -> dict:
 | `recency_weight` | 近期失败权重 |
 | `recency_window_size` | 近期窗口大小 |
 
-**归一化与容差：** 三个权重值之和应在 1.0 的容差范围内。默认容差为 0.001，可通过 `weight_tolerance` 参数调整。超出容差时自动归一化（默认行为），或抛出错误。
+### 归一化容差三档预设
+
+三个权重值之和应在 1.0 的容差范围内。提供三档预设供运维选择：
+
+| 预设名称 | 容差值 | 说明 | 适用场景 |
+|----------|--------|------|----------|
+| `strict` | 0.001 | 精确归一化，仅允许浮点误差 | 生产环境，权重需严格等于 1.0 |
+| `normal` | 0.01 | 允许 1% 偏差 | 日常使用，权重手工配置时的小误差 |
+| `loose` | 0.05 | 允许 5% 偏差 | 探索性分析，快速调参无需精确归一 |
+
+超出容差时自动归一化（默认行为），或抛出错误。
 
 ```python
 from flake_summary.classifier import WeightsConfig, TestCaseClassifier
 
-# 自定义容差（更宽松）
+# 使用预设
+tolerance = WeightsConfig.tolerance_preset("normal")  # 0.01
+
 weights = WeightsConfig(fail_rate_weight=0.5, transition_weight=0.35, recency_weight=0.16)
-classifier = TestCaseClassifier(weights=weights, weight_tolerance=0.02)
+classifier = TestCaseClassifier(weights=weights, weight_tolerance=tolerance)
+
+# 也可直接传数值
+classifier = TestCaseClassifier(weights=weights, weight_tolerance=0.05)
 ```
 
-## Token 自动刷新
+## Token 认证链与降级策略
 
-当使用 Bearer Token 认证时，支持配置自动刷新机制以避免 token 过期导致的失败。
+当使用 Bearer Token 认证时，支持配置完整的认证链来处理 token 过期场景。
 
-**容错机制：** 如果刷新函数本身抛出异常，系统会自动退回原 token 继续使用，避免整个任务因刷新失败而中断。
+### 认证链流程
 
-使用方式（Python API）：
+```
+请求 → 401/403?
+  ├─ 是 → 有 token_refresh_fn 且未超重试次数?
+  │     ├─ 是 → 调用 refresh_fn
+  │     │     ├─ 成功 → 用新 token 重试
+  │     │     └─ 失败(异常) → 退回原 token，标记刷新耗尽
+  │     └─ 否 → 原始 token 也过期，触发 on_auth_exhausted 策略
+  └─ 否 → 正常返回
+```
+
+### on_auth_exhausted 策略
+
+当 token 刷新失败且原始 token 也过期时，通过 `on_auth_exhausted` 参数控制行为：
+
+| 值 | 行为 | 适用场景 |
+|----|------|----------|
+| `"abort"` (默认) | 抛出 HTTPError，任务终止 | 数据完整性要求高，不允许无认证读取 |
+| `"readonly"` | 去掉认证头重试一次，若成功则返回只读数据 | CI 系统支持公开只读访问，宁可降低权限也要拿到数据 |
+
+**注意：** `readonly` 模式下重试也失败时，仍抛出原始 HTTPError，不会无限 hang。
 
 ```python
-from flake_summary.parser import HTTPConfig, TestResultParser
+from flake_summary.parser import HTTPConfig
 
-def refresh_token():
-    # 调用你的 token 刷新接口
-    return "new_token_value"
-
+# 策略一：认证耗尽时直接放弃（默认）
 config = HTTPConfig(
     bearer_token="initial_token",
-    token_refresh_fn=refresh_token,
-    max_refresh_retries=1,
+    token_refresh_fn=refresh_fn,
+    on_auth_exhausted="abort",
 )
 
-result = TestResultParser.parse_file("https://ci.example.com/run.xml", config)
+# 策略二：认证耗尽时降级到只读
+config = HTTPConfig(
+    bearer_token="initial_token",
+    token_refresh_fn=refresh_fn,
+    on_auth_exhausted="readonly",
+)
 ```
-
-**刷新流程：**
-1. 请求返回 401/403 时，尝试调用 `token_refresh_fn` 获取新 token
-2. 刷新成功 → 用新 token 重试请求
-3. 刷新失败（异常）→ 退回原 token 继续尝试，避免任务全失败
-4. 超过最大重试次数 → 抛出原始 HTTPError
 
 ## 时间窗口与跨年 ISO Week 处理
 
-`--time-window` 参数支持多种时间戳格式，包括 ISO week 格式（如 `2025-W53-1`）。在跨年场景下，ISO week 边界需要特别注意：
+`--time-window` 参数支持多种时间戳格式，包括 ISO week 格式（如 `2020-W53-1`）。在跨年场景下，ISO week 边界需要特别注意。
 
-### 2025-W53 与 2026-W01 边界的三种取值场景
+### 三种取值场景与优先级
 
-ISO 8601 周历中，年末年初可能出现 W53（部分年份）和 W01 的边界重叠。本工具提供三种语义解读：
+| 场景 | 优先级 | Default | 说明 |
+|------|--------|---------|------|
+| 语义层（Semantic） | **1（最高）** | ✅ 本工具默认 | 严格按 ISO 8601 定义解析，`fromisocalendar()` 直接映射为精确日期 |
+| 历史（Historical） | 2 | 自动转换 | ISO week 解析后自动转为日历日期，时间窗口过滤基于实际日期计算 |
+| 当周（Current Week） | 3（最低） | ❌ 不默认 | 仅按周数差值判断，不考虑具体日期；需外部实现 |
 
-#### 1. 语义层（Semantic / ISO 标准解读）
+**优先级含义：** 本工具始终先按语义层解析 ISO week，然后自动转为历史模式做日期比较。当周模式不作为默认行为，因为同一周数在不同年份的含义不同，可能导致误判。
 
-- `2025-W53-1` = 2025 年最后一周的周一（2025-12-29）
-- `2026-W01-1` = 2026 年第一周的周一（2026-01-05）
-- 两者不重叠，严格按 ISO 8601 定义
+### 跨年边界映射表
 
-**适用场景：** CI 系统输出的时间戳本身符合 ISO 8601 周格式，需要精确语义匹配。
+以 2020→2021 年为例（2020 年有 W53）：
 
-本工具默认使用此模式：`datetime.fromisocalendar(year, week, day)` 进行解析。
+| ISO Week 标识 | 语义层日期 | 历史模式日期范围 | 当周模式（周数差） | Default 取值 |
+|--------------|-----------|-----------------|-------------------|-------------|
+| `2020-W52-1` | 2020-12-21 | 12/21 ~ 12/27 | 距今 N 周 | 语义层 → 2020-12-21 |
+| `2020-W53-1` | 2020-12-28 | 12/28 ~ 01/03 | 距今 N-1 周 | 语义层 → 2020-12-28 |
+| `2021-W01-1` | 2021-01-04 | 01/04 ~ 01/10 | 距今 N-2 周 | 语义层 → 2021-01-04 |
 
-#### 2. 历史（Historical / 日历映射）
-
-- `2025-W53` 映射到该周的实际日期范围（2025-12-29 ~ 2026-01-04）
-- `2026-W01` 映射到（2026-01-05 ~ 2026-01-11）
-- 时间窗口过滤基于实际日期计算
-
-**适用场景：** 需要将 ISO week 转换为精确日期范围后进行时间窗口过滤。本工具在解析 ISO week 格式后自动转换为此模式进行过滤。
-
-#### 3. 当周（Current Week / 周数差值）
-
-- 计算当前周与目标周的周数差值
-- `2025-W53` 距 `2026-W25` 约 25 周前
-- 不考虑具体日期，仅按周数差判断
-
-**适用场景：** 某些 CI 系统只用周数标识构建，不关心具体日期。
-
-### 跨年处理注意事项
-
-- 并非所有年份都有 W53：只有当年首周的周四所在的年有 53 周时才存在（如 2020、2025、2031 年有 W53，2021、2026 年无 W53）
-- 本工具解析 `YYYY-Www-d` 格式时，使用 Python `datetime.fromisocalendar()` 自动处理无效周数（抛出 ValueError 后回退到其他格式）
-- 如果 CI 系统输出的是标准 ISO 日期时间格式，无需关心 ISO week 边界问题
+**关键点：**
+- `2020-W53` 和 `2021-W01` **不重叠**：W53 的日期范围是 12/28~01/03，W01 是 01/04~01/10
+- 2025-12-31 在 ISO 周历中属于 `2026-W01`（2025 年没有 W53）
+- 有 W53 的年份：2020、2026、2032…（该年首周周四所在年拥有 53 周）
 
 ## 被跳过样本
 
-当测试用例的运行次数不足 `--min-runs` 阈值时，该用例会被跳过，不参与分类统计。被跳过的用例 metadata 会输出到 JSON 的 `skipped_tests` 字段中，方便下游 dashboard 展示。
+当测试用例运行次数不足 `--min-runs` 阈值时，不参与分类统计。被跳过用例的 metadata 输出到 JSON 的 `skipped_tests` 字段。
 
 ```json
 {
@@ -315,14 +328,24 @@ ISO 8601 周历中，年末年初可能出现 W53（部分年份）和 W01 的�
       "passed": 1,
       "failed": 1,
       "skipped_count": 0,
-      "reason": "insufficient_runs"
+      "reason": "insufficient_runs",
+      "skipped_sample_ids": ["run_001", "run_002"],
+      "skip_reason": "Only 2 run(s) collected, minimum 3 required for reliable classification"
     }
   ]
 }
 ```
 
+**字段说明：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `skipped_sample_ids` | `string[]` | 该用例参与的 CI run ID 列表，下游可据此回溯具体构建 |
+| `skip_reason` | `string` | 人类可读的跳过原因，可直接展示在 dashboard 上 |
+
 下游 dashboard 可据此：
-- 提示团队某用例样本不足，需要更多 CI 运行
+- 通过 `skipped_sample_ids` 追溯哪些 CI 构建包含了该用例
+- 通过 `skip_reason` 展示跳过原因，提示团队需要更多 CI 运行
 - 区分"未分类"与"分类为稳定"的用例
 - 追踪新加入用例的积累进度
 

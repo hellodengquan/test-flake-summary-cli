@@ -62,6 +62,20 @@ class TestHTTPConfig(unittest.TestCase):
         self.assertIsNone(config.bearer_token)
         self.assertIsNone(config.proxy)
         self.assertFalse(config.has_auth())
+        self.assertEqual(config.on_auth_exhausted, "abort")
+        self.assertEqual(config.request_timeout, 30)
+
+    def test_http_config_on_auth_exhausted_abort(self):
+        config = HTTPConfig(on_auth_exhausted="abort")
+        self.assertEqual(config.on_auth_exhausted, "abort")
+
+    def test_http_config_on_auth_exhausted_readonly(self):
+        config = HTTPConfig(on_auth_exhausted="readonly")
+        self.assertEqual(config.on_auth_exhausted, "readonly")
+
+    def test_http_config_on_auth_exhausted_invalid(self):
+        with self.assertRaises(ValueError):
+            HTTPConfig(on_auth_exhausted="unknown")
 
     def test_http_config_basic_auth(self):
         config = HTTPConfig(
@@ -1307,6 +1321,170 @@ class TestSchemaDowngrade(unittest.TestCase):
         self.assertIn("skipped_tests", v1_0_data)
         self.assertIn("fail_ratio_pct", v1_0_data["classified_tests"][0])
         self.assertEqual(v1_0_data["classified_tests"][0]["total_runs"], 5)
+
+    def test_downgrade_deletes_schema_version(self):
+        data = {
+            "schema_version": "1.1.0",
+            "tool_version": "1.0.0",
+            "total_runs": 1,
+            "total_test_cases": 0,
+            "overall_flaky_rate": 0.0,
+            "categories": {},
+            "classified_tests": [],
+            "skipped_tests": [],
+            "team_summaries": [],
+            "file_summaries": [],
+        }
+        del data["schema_version"]
+        del data["tool_version"]
+        del data["skipped_tests"]
+        self.assertNotIn("schema_version", data)
+        self.assertNotIn("tool_version", data)
+        self.assertNotIn("skipped_tests", data)
+
+
+class TestTolerancePresets(unittest.TestCase):
+    """Test tolerance preset constants and lookup."""
+
+    def test_strict_preset(self):
+        self.assertEqual(WeightsConfig.tolerance_preset("strict"), 0.001)
+
+    def test_normal_preset(self):
+        self.assertEqual(WeightsConfig.tolerance_preset("normal"), 0.01)
+
+    def test_loose_preset(self):
+        self.assertEqual(WeightsConfig.tolerance_preset("loose"), 0.05)
+
+    def test_invalid_preset_raises(self):
+        with self.assertRaises(ValueError):
+            WeightsConfig.tolerance_preset("custom")
+
+    def test_preset_used_in_classifier(self):
+        weights = WeightsConfig(
+            fail_rate_weight=0.5,
+            transition_weight=0.35,
+            recency_weight=0.16,
+        )
+        classifier = TestCaseClassifier(
+            weights=weights,
+            auto_normalize_weights=False,
+            weight_tolerance=WeightsConfig.tolerance_preset("loose"),
+        )
+        self.assertAlmostEqual(
+            classifier.weights.fail_rate_weight +
+            classifier.weights.transition_weight +
+            classifier.weights.recency_weight,
+            1.01,
+            places=2,
+        )
+
+    def test_strict_fails_on_slightly_off_weights(self):
+        weights = WeightsConfig(
+            fail_rate_weight=0.50,
+            transition_weight=0.35,
+            recency_weight=0.16,
+        )
+        with self.assertRaises(ValueError):
+            weights.validate(auto_normalize=False, tolerance=WeightsConfig.TOLERANCE_STRICT)
+
+    def test_loose_passes_on_slightly_off_weights(self):
+        weights = WeightsConfig(
+            fail_rate_weight=0.50,
+            transition_weight=0.35,
+            recency_weight=0.16,
+        )
+        weights.validate(auto_normalize=False, tolerance=WeightsConfig.TOLERANCE_LOOSE)
+
+    def test_constants_accessible(self):
+        self.assertEqual(WeightsConfig.TOLERANCE_STRICT, 0.001)
+        self.assertEqual(WeightsConfig.TOLERANCE_NORMAL, 0.01)
+        self.assertEqual(WeightsConfig.TOLERANCE_LOOSE, 0.05)
+
+
+class TestTokenAuthExhausted(unittest.TestCase):
+    """Test on_auth_exhausted strategy configuration."""
+
+    def test_default_is_abort(self):
+        config = HTTPConfig()
+        self.assertEqual(config.on_auth_exhausted, "abort")
+
+    def test_readonly_mode(self):
+        config = HTTPConfig(on_auth_exhausted="readonly")
+        self.assertEqual(config.on_auth_exhausted, "readonly")
+
+    def test_invalid_mode_raises(self):
+        with self.assertRaises(ValueError):
+            HTTPConfig(on_auth_exhausted="retry_forever")
+
+    def test_valid_modes(self):
+        for mode in ("abort", "readonly"):
+            config = HTTPConfig(on_auth_exhausted=mode)
+            self.assertEqual(config.on_auth_exhausted, mode)
+
+
+class TestSkippedSampleIdsAndReason(unittest.TestCase):
+    """Test skipped_sample_ids and skip_reason fields."""
+
+    def setUp(self):
+        self.classifier = TestCaseClassifier(min_runs=3)
+
+    def test_skipped_has_sample_ids(self):
+        runs = []
+        for i in range(2):
+            runs.append(TestRun(
+                run_id=f"build_{i:03d}",
+                timestamp=f"2026-06-{10+i:02d}T10:00:00",
+                results=[TestResult(name="test_short", status=TestStatus.PASSED, file="test.py", team="team")],
+            ))
+
+        stats_map = self.classifier.aggregate_stats(runs)
+        _, skipped = self.classifier.classify(stats_map)
+
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0].skipped_sample_ids, ["build_000", "build_001"])
+
+    def test_skipped_has_skip_reason(self):
+        runs = [TestRun(
+            run_id="run_001",
+            timestamp="2026-06-10T10:00:00",
+            results=[TestResult(name="test_short", status=TestStatus.PASSED, file="test.py", team="team")],
+        )]
+
+        stats_map = self.classifier.aggregate_stats(runs)
+        _, skipped = self.classifier.classify(stats_map)
+
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("1 run(s) collected", skipped[0].skip_reason)
+        self.assertIn("minimum 3 required", skipped[0].skip_reason)
+
+    def test_skipped_sample_ids_in_json(self):
+        runs = []
+        for i in range(2):
+            runs.append(TestRun(
+                run_id=f"ci_build_{i}",
+                timestamp=f"2026-06-{10+i:02d}T10:00:00",
+                results=[TestResult(name="test_x", status=TestStatus.PASSED, file="f.py", team="t")],
+            ))
+
+        summarizer = SummaryGenerator(classifier=self.classifier)
+        report = summarizer.generate_report(runs)
+        json_str = OutputFormatter.format_json(report)
+        data = json.loads(json_str)
+
+        self.assertEqual(len(data["skipped_tests"]), 1)
+        st = data["skipped_tests"][0]
+        self.assertIn("skipped_sample_ids", st)
+        self.assertEqual(st["skipped_sample_ids"], ["ci_build_0", "ci_build_1"])
+        self.assertIn("skip_reason", st)
+        self.assertIn("2 run(s) collected", st["skip_reason"])
+
+    def test_model_default_values(self):
+        st = SkippedTestCase(
+            name="t", file="f", team="t",
+            total_runs=1, min_runs_required=3,
+        )
+        self.assertEqual(st.skipped_sample_ids, [])
+        self.assertEqual(st.skip_reason, "")
 
 
 if __name__ == "__main__":

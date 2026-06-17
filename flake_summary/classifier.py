@@ -69,6 +69,24 @@ class WeightsConfig:
     recency_weight: float = 0.2
     recency_window_size: int = 5
 
+    TOLERANCE_STRICT = 0.001
+    TOLERANCE_NORMAL = 0.01
+    TOLERANCE_LOOSE = 0.05
+
+    @classmethod
+    def tolerance_preset(cls, preset: str) -> float:
+        presets = {
+            "strict": cls.TOLERANCE_STRICT,
+            "normal": cls.TOLERANCE_NORMAL,
+            "loose": cls.TOLERANCE_LOOSE,
+        }
+        if preset not in presets:
+            raise ValueError(
+                f"Unknown tolerance preset '{preset}'. "
+                f"Available: {list(presets.keys())}"
+            )
+        return presets[preset]
+
     @classmethod
     def from_dict(cls, data: Dict) -> "WeightsConfig":
         return cls(
@@ -172,6 +190,7 @@ class TestCaseClassifier:
 
                 stats = stats_map[key]
                 stats.history.append(result.status)
+                stats.sample_run_ids.append(run.run_id)
 
                 if result.status == TestStatus.PASSED:
                     stats.passed += 1
@@ -200,6 +219,11 @@ class TestCaseClassifier:
                     failed=stats.failed,
                     skipped=stats.skipped,
                     reason="insufficient_runs",
+                    skipped_sample_ids=list(stats.sample_run_ids),
+                    skip_reason=(
+                        f"Only {stats.total_runs} run(s) collected, "
+                        f"minimum {self.min_runs} required for reliable classification"
+                    ),
                 ))
                 continue
 

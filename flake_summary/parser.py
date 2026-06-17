@@ -34,6 +34,16 @@ class HTTPConfig:
     proxy: Optional[Dict[str, str]] = None
     custom_headers: Dict[str, str] = field(default_factory=dict)
     request_timeout: int = 30
+    on_auth_exhausted: str = "abort"
+
+    VALID_ON_AUTH_EXHAUSTED = ("abort", "readonly")
+
+    def __post_init__(self):
+        if self.on_auth_exhausted not in self.VALID_ON_AUTH_EXHAUSTED:
+            raise ValueError(
+                f"on_auth_exhausted must be one of {self.VALID_ON_AUTH_EXHAUSTED}, "
+                f"got '{self.on_auth_exhausted}'"
+            )
 
     def has_auth(self) -> bool:
         return (
@@ -81,6 +91,15 @@ class TestResultParser:
                         current_token = original_token
                         refresh_attempts = http_config.max_refresh_retries
                         continue
+
+                if e.code in (401, 403) and http_config.on_auth_exhausted == "readonly":
+                    try:
+                        content = TestResultParser._fetch_url(url, http_config, token=None)
+                        run_id = os.path.basename(urlparse(url).path) or url
+                        return TestResultParser._parse_content(content, run_id)
+                    except Exception:
+                        raise e
+
                 raise
             except URLError:
                 raise

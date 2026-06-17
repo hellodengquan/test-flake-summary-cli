@@ -76,6 +76,8 @@ class OutputFormatter:
             "failed": st.failed,
             "skipped_count": st.skipped,
             "reason": st.reason,
+            "skipped_sample_ids": st.skipped_sample_ids,
+            "skip_reason": st.skip_reason,
         }
 
     @staticmethod
