@@ -1,9 +1,10 @@
 """Test case classifier and statistics aggregator."""
 
 import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from .models import (
@@ -13,6 +14,49 @@ from .models import (
     TestRun,
     TestStatus,
 )
+
+
+def _parse_timestamp(timestamp: str) -> Optional[datetime]:
+    if not timestamp:
+        return None
+
+    ts = timestamp.strip()
+    if not ts:
+        return None
+
+    ts = ts.replace("Z", "+00:00")
+
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        pass
+
+    formats = [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(ts, fmt)
+        except ValueError:
+            continue
+
+    iso_week_match = re.match(r"(\d{4})-W(\d{2})-(\d)", ts)
+    if iso_week_match:
+        year = int(iso_week_match.group(1))
+        week = int(iso_week_match.group(2))
+        day = int(iso_week_match.group(3))
+        try:
+            return datetime.fromisocalendar(year, week, day)
+        except ValueError:
+            pass
+
+    return None
 
 
 @dataclass
@@ -39,13 +83,34 @@ class WeightsConfig:
             data = json.load(f)
         return cls.from_dict(data)
 
-    def validate(self) -> None:
-        total = self.fail_rate_weight + self.transition_weight + self.recency_weight
-        if abs(total - 1.0) > 0.001:
-            raise ValueError(
-                f"Weight sum must equal 1.0, got {total}")
+    def validate(self, auto_normalize: bool = False) -> None:
+        if self.fail_rate_weight < 0 or self.transition_weight < 0 or self.recency_weight < 0:
+            raise ValueError("All weights must be non-negative")
         if self.recency_window_size < 1:
             raise ValueError("recency_window_size must be >= 1")
+
+        total = self.fail_rate_weight + self.transition_weight + self.recency_weight
+        if total == 0:
+            raise ValueError("Sum of weights must be greater than 0")
+
+        if auto_normalize and abs(total - 1.0) > 0.001:
+            self.fail_rate_weight /= total
+            self.transition_weight /= total
+            self.recency_weight /= total
+        elif abs(total - 1.0) > 0.001:
+            raise ValueError(
+                f"Weight sum must equal 1.0, got {total:.4f}. "
+                "Set auto_normalize=True to auto-normalize."
+            )
+
+    def normalize(self) -> None:
+        total = self.fail_rate_weight + self.transition_weight + self.recency_weight
+        if total == 0:
+            raise ValueError("Cannot normalize: sum of weights is zero")
+        if abs(total - 1.0) > 0.001:
+            self.fail_rate_weight /= total
+            self.transition_weight /= total
+            self.recency_weight /= total
 
 
 class TestCaseClassifier:
@@ -58,11 +123,13 @@ class TestCaseClassifier:
         fail_ratio_threshold: float = 0.7,
         weights: Optional[WeightsConfig] = None,
         time_window_days: Optional[int] = None,
+        auto_normalize_weights: bool = True,
     ):
         self.min_runs = min_runs
         self.stable_pass_threshold = stable_pass_threshold
         self.fail_ratio_threshold = fail_ratio_threshold
         self.weights = weights or WeightsConfig()
+        self.weights.validate(auto_normalize=auto_normalize_weights)
         self.time_window_days = time_window_days
 
     def filter_runs_by_time_window(self, test_runs: List[TestRun]) -> List[TestRun]:
@@ -73,12 +140,17 @@ class TestCaseClassifier:
         filtered = []
 
         for run in test_runs:
-            try:
-                ts = run.timestamp.replace("Z", "+00:00")
-                run_date = datetime.fromisoformat(ts)
-                if run_date >= cutoff_date:
-                    filtered.append(run)
-            except (ValueError, AttributeError, TypeError):
+            run_date = _parse_timestamp(run.timestamp)
+            if run_date is None:
+                filtered.append(run)
+                continue
+
+            if run_date.tzinfo is not None and cutoff_date.tzinfo is None:
+                run_date = run_date.replace(tzinfo=None)
+            elif run_date.tzinfo is None and cutoff_date.tzinfo is not None:
+                cutoff_date = cutoff_date.replace(tzinfo=None)
+
+            if run_date >= cutoff_date:
                 filtered.append(run)
 
         return filtered
@@ -114,6 +186,9 @@ class TestCaseClassifier:
         classified = []
 
         for stats in stats_map.values():
+            if stats.total_runs < self.min_runs:
+                continue
+
             category, flaky_score, fail_ratio = self._classify_case(stats)
             classified.append(
                 ClassifiedTestCase(
@@ -129,13 +204,12 @@ class TestCaseClassifier:
     def _classify_case(
         self, stats: TestCaseStats
     ) -> tuple[TestCategory, float, float]:
-        fail_ratio = stats.fail_rate
-        flaky_score = self._calculate_flaky_score(stats)
+        total = stats.total_runs
+        if total == 0:
+            return TestCategory.STABLE_PASS, 0.0, 0.0
 
-        if stats.total_runs < self.min_runs:
-            if fail_ratio > 0:
-                return TestCategory.FLAKY, flaky_score, fail_ratio
-            return TestCategory.STABLE_PASS, flaky_score, fail_ratio
+        fail_ratio = stats.failed / total if total > 0 else 0.0
+        flaky_score = self._calculate_flaky_score(stats)
 
         if stats.failed > 0 and stats.passed == 0:
             return TestCategory.CONTINUOUS_FAIL, flaky_score, fail_ratio

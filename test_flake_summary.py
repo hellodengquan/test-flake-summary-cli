@@ -335,13 +335,13 @@ class TestClassifier(unittest.TestCase):
         self.assertEqual(classified[0].category, TestCategory.CONTINUOUS_FAIL)
         self.assertEqual(classified[0].stats.fail_rate, 1.0)
 
-    def test_insufficient_runs(self):
+    def test_insufficient_runs_skipped(self):
         statuses = [TestStatus.FAILED, TestStatus.PASSED]
         runs = self._create_test_runs("test_insufficient", statuses)
         stats_map = self.classifier.aggregate_stats(runs)
         classified = self.classifier.classify(stats_map)
 
-        self.assertEqual(classified[0].category, TestCategory.FLAKY)
+        self.assertEqual(len(classified), 0)
 
     def test_flaky_score_calculation(self):
         statuses = [
@@ -441,44 +441,28 @@ class TestSummarizer(unittest.TestCase):
     """Summary generator tests."""
 
     def test_team_and_file_grouping(self):
-        runs = [
-            TestRun(
-                run_id="run_001",
-                timestamp="2026-06-10T10:00:00",
-                results=[
-                    TestResult(
-                        name="test1",
-                        status=TestStatus.PASSED,
-                        file="file1.py",
-                        team="team-a",
-                    ),
-                    TestResult(
-                        name="test2",
-                        status=TestStatus.FAILED,
-                        file="file2.py",
-                        team="team-b",
-                    ),
-                ],
-            ),
-            TestRun(
-                run_id="run_002",
-                timestamp="2026-06-11T10:00:00",
-                results=[
-                    TestResult(
-                        name="test1",
-                        status=TestStatus.FAILED,
-                        file="file1.py",
-                        team="team-a",
-                    ),
-                    TestResult(
-                        name="test2",
-                        status=TestStatus.PASSED,
-                        file="file2.py",
-                        team="team-b",
-                    ),
-                ],
-            ),
-        ]
+        runs = []
+        for i in range(3):
+            runs.append(
+                TestRun(
+                    run_id=f"run_{i:03d}",
+                    timestamp=f"2026-06-{10+i:02d}T10:00:00",
+                    results=[
+                        TestResult(
+                            name="test1",
+                            status=TestStatus.PASSED if i % 2 == 0 else TestStatus.FAILED,
+                            file="file1.py",
+                            team="team-a",
+                        ),
+                        TestResult(
+                            name="test2",
+                            status=TestStatus.FAILED if i % 2 == 0 else TestStatus.PASSED,
+                            file="file2.py",
+                            team="team-b",
+                        ),
+                    ],
+                )
+            )
 
         summarizer = SummaryGenerator()
         report = summarizer.generate_report(runs)
@@ -771,6 +755,258 @@ class TestCLI(unittest.TestCase):
             "--fail-ratio", "0.5",
         ])
         self.assertEqual(exit_code, 0)
+
+
+class TestTimestampParsing(unittest.TestCase):
+    """Test robust timestamp parsing."""
+
+    def test_parse_iso_format(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        dt = _parse_timestamp("2026-06-17T10:00:00")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2026)
+        self.assertEqual(dt.month, 6)
+        self.assertEqual(dt.day, 17)
+
+    def test_parse_iso_with_z(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        dt = _parse_timestamp("2026-06-17T10:00:00Z")
+        self.assertIsNotNone(dt)
+
+    def test_parse_date_only(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        dt = _parse_timestamp("2026-06-17")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2026)
+        self.assertEqual(dt.month, 6)
+        self.assertEqual(dt.day, 17)
+
+    def test_parse_slash_format(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        dt = _parse_timestamp("2026/06/17 10:00:00")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2026)
+
+    def test_parse_iso_week_format(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        dt = _parse_timestamp("2026-W25-3")
+        self.assertIsNotNone(dt)
+
+    def test_parse_invalid_returns_none(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        self.assertIsNone(_parse_timestamp(""))
+        self.assertIsNone(_parse_timestamp("invalid"))
+        self.assertIsNone(_parse_timestamp("not-a-date"))
+
+    def test_parse_empty_or_none(self):
+        from flake_summary.classifier import _parse_timestamp
+
+        self.assertIsNone(_parse_timestamp(""))
+        self.assertIsNone(_parse_timestamp("   "))
+
+
+class TestWeightsValidation(unittest.TestCase):
+    """Test weights configuration validation."""
+
+    def test_auto_normalize_weights(self):
+        weights = WeightsConfig(
+            fail_rate_weight=2.0,
+            transition_weight=1.0,
+            recency_weight=1.0,
+        )
+        weights.validate(auto_normalize=True)
+
+        total = weights.fail_rate_weight + weights.transition_weight + weights.recency_weight
+        self.assertAlmostEqual(total, 1.0, places=3)
+        self.assertAlmostEqual(weights.fail_rate_weight, 0.5)
+
+    def test_negative_weights_raises(self):
+        weights = WeightsConfig(
+            fail_rate_weight=-0.1,
+            transition_weight=0.5,
+            recency_weight=0.6,
+        )
+        with self.assertRaises(ValueError):
+            weights.validate()
+
+    def test_zero_sum_raises(self):
+        weights = WeightsConfig(
+            fail_rate_weight=0.0,
+            transition_weight=0.0,
+            recency_weight=0.0,
+        )
+        with self.assertRaises(ValueError):
+            weights.validate()
+
+    def test_normalize_method(self):
+        weights = WeightsConfig(
+            fail_rate_weight=5.0,
+            transition_weight=3.0,
+            recency_weight=2.0,
+        )
+        weights.normalize()
+
+        self.assertAlmostEqual(weights.fail_rate_weight, 0.5)
+        self.assertAlmostEqual(weights.transition_weight, 0.3)
+        self.assertAlmostEqual(weights.recency_weight, 0.2)
+
+    def test_classifier_auto_normalizes(self):
+        weights = WeightsConfig(
+            fail_rate_weight=10.0,
+            transition_weight=5.0,
+            recency_weight=5.0,
+        )
+        classifier = TestCaseClassifier(weights=weights, auto_normalize_weights=True)
+
+        total = (
+            classifier.weights.fail_rate_weight
+            + classifier.weights.transition_weight
+            + classifier.weights.recency_weight
+        )
+        self.assertAlmostEqual(total, 1.0, places=3)
+
+
+class TestHTTPTokenRefresh(unittest.TestCase):
+    """Test HTTP token refresh mechanism."""
+
+    def test_can_refresh_token_with_callback(self):
+        config = HTTPConfig(
+            bearer_token="initial-token",
+            token_refresh_fn=lambda: "new-token",
+        )
+        self.assertTrue(config.can_refresh_token())
+
+    def test_cannot_refresh_without_callback(self):
+        config = HTTPConfig(bearer_token="initial-token")
+        self.assertFalse(config.can_refresh_token())
+
+    def test_cannot_refresh_without_token(self):
+        config = HTTPConfig(token_refresh_fn=lambda: "new-token")
+        self.assertFalse(config.can_refresh_token())
+
+    def test_default_timeout(self):
+        config = HTTPConfig()
+        self.assertEqual(config.request_timeout, 30)
+
+    def test_custom_timeout(self):
+        config = HTTPConfig(request_timeout=60)
+        self.assertEqual(config.request_timeout, 60)
+
+    def test_max_refresh_retries_default(self):
+        config = HTTPConfig()
+        self.assertEqual(config.max_refresh_retries, 1)
+
+
+class TestMinRunsSkip(unittest.TestCase):
+    """Test that test cases with insufficient runs are skipped."""
+
+    def setUp(self):
+        self.classifier = TestCaseClassifier(min_runs=3)
+
+    def _create_runs(self, test_name: str, count: int, fail: bool = False) -> List[TestRun]:
+        runs = []
+        for i in range(count):
+            status = TestStatus.FAILED if fail and i == 0 else TestStatus.PASSED
+            run = TestRun(
+                run_id=f"run_{i:03d}",
+                timestamp=f"2026-06-{10+i:02d}T10:00:00",
+                results=[
+                    TestResult(
+                        name=test_name,
+                        status=status,
+                        file="test.py",
+                        team="team",
+                    )
+                ],
+            )
+            runs.append(run)
+        return runs
+
+    def test_zero_runs_skipped(self):
+        runs = []
+        stats_map = self.classifier.aggregate_stats(runs)
+        classified = self.classifier.classify(stats_map)
+        self.assertEqual(len(classified), 0)
+
+    def test_one_run_skipped(self):
+        runs = self._create_runs("test_1run", 1)
+        stats_map = self.classifier.aggregate_stats(runs)
+        classified = self.classifier.classify(stats_map)
+        self.assertEqual(len(classified), 0)
+
+    def test_two_runs_skipped(self):
+        runs = self._create_runs("test_2runs", 2)
+        stats_map = self.classifier.aggregate_stats(runs)
+        classified = self.classifier.classify(stats_map)
+        self.assertEqual(len(classified), 0)
+
+    def test_three_runs_included(self):
+        runs = self._create_runs("test_3runs", 3)
+        stats_map = self.classifier.aggregate_stats(runs)
+        classified = self.classifier.classify(stats_map)
+        self.assertEqual(len(classified), 1)
+
+    def test_mixed_runs_some_skipped(self):
+        runs_3 = self._create_runs("test_enough", 3)
+        runs_2 = self._create_runs("test_short", 2)
+
+        all_runs = runs_3 + runs_2
+        stats_map = self.classifier.aggregate_stats(all_runs)
+        classified = self.classifier.classify(stats_map)
+
+        names = [c.stats.name for c in classified]
+        self.assertIn("test_enough", names)
+        self.assertNotIn("test_short", names)
+
+
+class TestFailRatioEdgeCases(unittest.TestCase):
+    """Test fail ratio edge cases and division by zero protection."""
+
+    def setUp(self):
+        self.classifier = TestCaseClassifier(min_runs=1)
+
+    def test_zero_runs_fail_ratio_zero(self):
+        from flake_summary.models import TestCaseStats
+
+        stats = TestCaseStats(name="test", file="f.py", team="t")
+        category, score, fail_ratio = self.classifier._classify_case(stats)
+
+        self.assertEqual(fail_ratio, 0.0)
+        self.assertEqual(score, 0.0)
+        self.assertEqual(category, TestCategory.STABLE_PASS)
+
+    def test_all_skipped_fail_ratio_zero(self):
+        from flake_summary.models import TestCaseStats
+
+        stats = TestCaseStats(
+            name="test",
+            file="f.py",
+            team="t",
+            skipped=5,
+        )
+        category, score, fail_ratio = self.classifier._classify_case(stats)
+
+        self.assertEqual(fail_ratio, 0.0)
+        self.assertEqual(score, 0.0)
+
+    def test_flaky_score_zero_when_no_failures(self):
+        from flake_summary.models import TestCaseStats
+
+        stats = TestCaseStats(
+            name="test",
+            file="f.py",
+            team="t",
+            passed=10,
+            failed=0,
+        )
+        score = self.classifier._calculate_flaky_score(stats)
+        self.assertEqual(score, 0.0)
 
 
 if __name__ == "__main__":

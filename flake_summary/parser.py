@@ -3,10 +3,12 @@
 import base64
 import json
 import os
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import (
     HTTPBasicAuthHandler,
@@ -27,8 +29,11 @@ class HTTPConfig:
 
     basic_auth: Optional[Dict[str, str]] = None
     bearer_token: Optional[str] = None
+    token_refresh_fn: Optional[Callable[[], str]] = None
+    max_refresh_retries: int = 1
     proxy: Optional[Dict[str, str]] = None
     custom_headers: Dict[str, str] = field(default_factory=dict)
+    request_timeout: int = 30
 
     def has_auth(self) -> bool:
         return (
@@ -36,6 +41,9 @@ class HTTPConfig:
             or self.bearer_token is not None
             or self.proxy is not None
         )
+
+    def can_refresh_token(self) -> bool:
+        return self.bearer_token is not None and self.token_refresh_fn is not None
 
 
 class TestResultParser:
@@ -51,7 +59,30 @@ class TestResultParser:
     @staticmethod
     def _parse_url(url: str, http_config: Optional[HTTPConfig] = None) -> TestRun:
         http_config = http_config or HTTPConfig()
+        current_token = http_config.bearer_token
+        refresh_attempts = 0
 
+        while True:
+            try:
+                content = TestResultParser._fetch_url(url, http_config, current_token)
+                run_id = os.path.basename(urlparse(url).path) or url
+                return TestResultParser._parse_content(content, run_id)
+            except HTTPError as e:
+                if e.code in (401, 403) and http_config.can_refresh_token() and refresh_attempts < http_config.max_refresh_retries:
+                    current_token = http_config.token_refresh_fn()
+                    http_config.bearer_token = current_token
+                    refresh_attempts += 1
+                    continue
+                raise
+            except URLError:
+                raise
+
+    @staticmethod
+    def _fetch_url(
+        url: str,
+        http_config: HTTPConfig,
+        token: Optional[str] = None,
+    ) -> bytes:
         headers = {}
         handlers = []
 
@@ -63,8 +94,8 @@ class TestResultParser:
             ).decode("ascii")
             headers["Authorization"] = f"Basic {credentials}"
 
-        if http_config.bearer_token:
-            headers["Authorization"] = f"Bearer {http_config.bearer_token}"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
 
         if http_config.custom_headers:
             headers.update(http_config.custom_headers)
@@ -79,10 +110,8 @@ class TestResultParser:
             opener = build_opener(*handlers)
             install_opener(opener)
 
-        with urlopen(request) as response:
-            content = response.read()
-            run_id = os.path.basename(urlparse(url).path) or url
-            return TestResultParser._parse_content(content, run_id)
+        with urlopen(request, timeout=http_config.request_timeout) as response:
+            return response.read()
 
     @staticmethod
     def _parse_local_file(file_path: str) -> TestRun:
